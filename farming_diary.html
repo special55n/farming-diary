@@ -316,8 +316,8 @@ html,body{height:100%;background:var(--bg);font-family:'Hiragino Kaku Gothic Pro
   <div class="shandle"></div>
   <div class="stitle">費用を追加</div>
   <div class="field"><label>Googleレンズ等のテキストを貼り付け</label>
-    <textarea class="ocr-paste" id="oct" placeholder="コメリ 2025/05/01&#10;支柱2.1m 10本  ¥1,200&#10;マルチフィルム  ¥890&#10;合計 ¥2,090"></textarea>
-    <button class="ocr-btn" id="obt" onclick="parseR()">AIで品目・金額を読み取る</button>
+    <textarea class="ocr-paste" id="oct" placeholder="Googleレンズでスキャンしたテキストをそのまま貼り付けてください&#10;&#10;例：&#10;草木灰 500G　¥398&#10;金象印 三徳ジョレン　¥3,280&#10;合計 ¥15,709"></textarea>
+    <button class="ocr-btn" id="obt" onclick="parseR()">品目・金額を読み取る（無料）</button>
   </div>
   <div id="ores"></div>
   <div style="height:1px;background:var(--br);margin:14px 0;"></div>
@@ -459,26 +459,80 @@ function saveExp(){
 }
 function delExp(id){if(!confirm('削除しますか？'))return;exps=exps.filter(e=>e.id!==id);saveX();rExp();}
 
-async function parseR(){
+function parseR(){
   const text=document.getElementById('oct').value.trim();
   if(!text){alert('テキストを貼り付けてください');return;}
-  const btn=document.getElementById('obt');
-  btn.innerHTML='<span class="spinner"></span>読み取り中...';btn.disabled=true;
   document.getElementById('ores').innerHTML='';
-  const prompt=`以下はレシートOCRテキストです。品目・金額・日付を読み取りJSONのみ返してください。前置き不要。\n形式:{"date":"YYYY-MM-DD or null","items":[{"desc":"品目名","amt":金額数値,"cat":"資材|交通費|農薬・肥料|種・苗|その他"}]}\n合計・小計・消費税行は除外。\nテキスト:\n${text}`;
-  try{
-    const res=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:1000,messages:[{role:'user',content:prompt}]})});
-    const data=await res.json();
-    const raw=data.content.map(b=>b.text||'').join('').replace(/```json|```/g,'').trim();
-    const parsed=JSON.parse(raw);ois=parsed.items||[];
-    const dd=parsed.date||td();
-    if(!ois.length){document.getElementById('ores').innerHTML='<p style="color:var(--ts);font-size:13px;padding:7px 0;">品目が見つかりませんでした</p>';return;}
-    document.getElementById('ores').innerHTML=
-      `<div style="font-size:12px;color:var(--ts);margin-bottom:7px;">読み取り結果（確認・修正してから追加）</div>`+
-      ois.map((it,i)=>`<div class="oi" id="oi${i}"><div class="oirow"><input class="oidesc" type="text" value="${it.desc}" id="od${i}"><input class="oiamt" type="number" value="${it.amt}" id="oa${i}"><select class="oicat" id="oc${i}">${['資材','交通費','農薬・肥料','種・苗','その他'].map(c=>`<option${c===it.cat?' selected':''}>${c}</option>`).join('')}</select></div><button class="oiadd" id="ob${i}" onclick="addOI(${i},'${dd}')">追加する</button></div>`).join('')+
-      `<button class="oiall" onclick="addAllOI('${dd}')">すべて追加する</button>`;
-  }catch(e){document.getElementById('ores').innerHTML='<p style="color:var(--rd);font-size:13px;padding:7px 0;">読み取りに失敗しました。もう一度お試しください。</p>';}
-  finally{btn.innerHTML='AIで品目・金額を読み取る';btn.disabled=false;}
+
+  // 日付を検出（例: 2026年02月01日 / 2026/02/01 / 2026-02-01）
+  let detDate=td();
+  const dateM=text.match(/(\d{4})[年\/\-](\d{1,2})[月\/\-](\d{1,2})/);
+  if(dateM) detDate=`${dateM[1]}-${String(dateM[2]).padStart(2,'0')}-${String(dateM[3]).padStart(2,'0')}`;
+
+  // 除外キーワード
+  const skipWords=['合計','小計','消費税','内税','外税','税込','税抜','お買上','お釣','クレジット','ポイント','お客様','割引','会員','承認','支払','回数','ありがとう','またの','お待ち','TEL','FAX','登録番号','担:','本日','進呈','セール','<<','>>'];
+
+  // カテゴリ判定
+  function guessCat(desc){
+    if(/種|苗|球根|タネ|たね|ジャガイモ|サツマイモ|トマト|キュウリ|ナス|ピーマン|レタス|コリアンダー|パクチー|シソ|落花生|野菜/.test(desc)) return '種・苗';
+    if(/農薬|肥料|除草|殺虫|消毒|防虫|草木灰|有機|配合|石灰|堆肥|腐葉土|マルチ|液肥/.test(desc)) return '農薬・肥料';
+    if(/手袋|メガネ|マスク|長靴|雨具|作業着|軍手/.test(desc)) return '資材';
+    if(/ホー|ジョレン|スコップ|鍬|鎌|支柱|ネット|テープ|ひも|ポット|プランター|トレー|岩谷|マルチ押さえ|有孔/.test(desc)) return '資材';
+    if(/電池|バッテリー|HIGH-SP|LR/.test(desc)) return '資材';
+    if(/ガソリン|高速|バス|電車|交通|駐車/.test(desc)) return '交通費';
+    return 'その他';
+  }
+
+  const lines=text.split('\n');
+  ois=[];
+
+  for(let i=0;i<lines.length;i++){
+    const line=lines[i].trim();
+    if(!line) continue;
+
+    // スキップ判定
+    if(skipWords.some(w=>line.includes(w))) continue;
+    // 数字だけの行（商品コード等）をスキップ
+    if(/^\d{6,}$/.test(line)) continue;
+    // TEL・記号だけの行をスキップ
+    if(/^[0-9\-\(\)TEL: ]+$/.test(line)) continue;
+
+    // ¥マークから金額を抽出
+    const amtM=line.match(/[¥￥]\s*([\d,]+)/);
+    if(!amtM) continue;
+    const amt=parseInt(amtM[1].replace(/,/g,''));
+    if(!amt||amt<=0) continue;
+    // 合計金額っぽい大きい数字は除外（1万円超はスキップ、ただし品目として有効なものは通す）
+    if(amt>50000) continue;
+
+    // 品目名：¥より前の部分、商品コード（数字8桁以上）を除去
+    let desc=line.replace(/[¥￥]\s*[\d,]+/,'').replace(/\d{8,}/g,'').trim();
+    // 末尾の空白・記号を整理
+    desc=desc.replace(/[\s　]+$/,'').replace(/^[\s　]+/,'');
+    if(!desc||desc.length<2) continue;
+
+    // 次の行が割引行なら金額を調整
+    let finalAmt=amt;
+    if(i+1<lines.length){
+      const nextLine=lines[i+1];
+      if(nextLine.includes('割引')||nextLine.includes('値引')){
+        const discM=nextLine.match(/-\s*([\d,]+)/);
+        if(discM) finalAmt=amt-parseInt(discM[1].replace(/,/g,''));
+      }
+    }
+
+    ois.push({desc, amt:finalAmt, cat:guessCat(desc)});
+  }
+
+  if(!ois.length){
+    document.getElementById('ores').innerHTML='<p style="color:var(--ts);font-size:13px;padding:7px 0;">品目が見つかりませんでした。¥マークが含まれているか確認してください。</p>';
+    return;
+  }
+
+  document.getElementById('ores').innerHTML=
+    `<div style="font-size:12px;color:var(--ts);margin-bottom:7px;">${ois.length}件を読み取りました（内容を確認してから追加）</div>`+
+    ois.map((it,i)=>`<div class="oi" id="oi${i}"><div class="oirow"><input class="oidesc" type="text" value="${it.desc}" id="od${i}"><input class="oiamt" type="number" value="${it.amt}" id="oa${i}"><select class="oicat" id="oc${i}">${['資材','交通費','農薬・肥料','種・苗','その他'].map(c=>`<option${c===it.cat?' selected':''}>${c}</option>`).join('')}</select></div><button class="oiadd" id="ob${i}" onclick="addOI(${i},'${detDate}')">追加する</button></div>`).join('')+
+    `<button class="oiall" onclick="addAllOI('${detDate}')">すべて追加する</button>`;
 }
 function addOI(i,date){
   const desc=document.getElementById(`od${i}`).value.trim();const amt=parseInt(document.getElementById(`oa${i}`).value);const cat=document.getElementById(`oc${i}`).value;
